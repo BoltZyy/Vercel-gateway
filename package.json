@@ -1,0 +1,14 @@
+{
+  "name": "ai-router-proxy",
+  "version": "1.0.0",
+  "description": "Serverless AI Router Proxy dengan auto-fallback multi-provider, siap deploy ke Vercel",
+  "main": "api/index.js",
+  "engines": {
+    "node": ">=18.x"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "express": "^4.21.0"
+  },
+  "license": "MIT"
+}
