@@ -166,6 +166,38 @@ function resolveCustomProvider(requestedModel) {
 // 3. HANDLER UTAMA
 // =========================================================================
 module.exports = async (req, res) => {
+  try {
+    await handleRequest(req, res);
+  } catch (fatalErr) {
+    // Jaring pengaman TERAKHIR: menangkap error yang benar-benar tidak
+    // terduga (bug logika, req.body corrupt, dll) yang lolos dari semua
+    // try-catch di dalam handleRequest. Tanpa ini, error semacam ini akan
+    // membuat function crash tanpa respons ke client DAN tanpa log
+    // terstruktur — Vercel hanya akan catat native stack trace yang lebih
+    // sulit di-grep bersama log GATEWAY_ATTEMPT/GATEWAY_FINAL lainnya.
+    console.error(JSON.stringify({
+      tag: "GATEWAY_FATAL",
+      timestamp: new Date().toISOString(),
+      message: fatalErr?.message || String(fatalErr),
+      stack: fatalErr?.stack ? String(fatalErr.stack).slice(0, 1000) : null,
+    }));
+
+    if (!res.headersSent) {
+      res.status(500).json({
+        error: {
+          message: "Internal gateway error. Cek Vercel Logs dengan tag GATEWAY_FATAL.",
+        },
+      });
+    } else {
+      // Response (atau stream) sudah mulai terkirim ke client sebelum
+      // error terjadi — tidak bisa lagi kirim status/JSON baru, cukup
+      // tutup koneksinya supaya client tidak menggantung nunggu timeout.
+      try { res.end(); } catch (_) { /* koneksi mungkin sudah tertutup */ }
+    }
+  }
+};
+
+async function handleRequest(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
@@ -195,6 +227,20 @@ module.exports = async (req, res) => {
   }
 
   const clientBody = req.body || {};
+
+  // req.body kosong padahal method POST biasanya berarti body tidak
+  // ter-parse (JSON malformed dari client, atau Content-Type salah).
+  // Ini dicatat supaya kelihatan di log kalau client (bot A/SillyTavern)
+  // mengirim request yang rusak, bukan gateway yang salah.
+  if (Object.keys(clientBody).length === 0) {
+    console.warn(JSON.stringify({
+      tag: "GATEWAY_EMPTY_BODY",
+      timestamp: new Date().toISOString(),
+      message: "req.body kosong — kemungkinan JSON malformed atau Content-Type salah dari client.",
+      contentType: req.headers?.["content-type"] || null,
+    }));
+  }
+
   const isStream = clientBody.stream === true;
   const requestedModel = clientBody.model || "(tidak disebutkan client)";
   const basePayload = { ...clientBody };
@@ -251,6 +297,8 @@ module.exports = async (req, res) => {
     delete payload.safety_settings;
     delete payload.extra_body;
 
+    const attemptStartedAt = Date.now(); // untuk hitung latency per attempt
+
     try {
       if (isStream) {
         // -----------------------------------------------------------------
@@ -284,6 +332,7 @@ module.exports = async (req, res) => {
             model: provider.model,
             status: "failed",
             httpStatus: upstream.status,
+            durationMs: Date.now() - attemptStartedAt,
             detail: errBody.slice(0, 500),
           });
           attemptLog.push({ provider: provider.name, model: provider.model, status: "failed", httpStatus: upstream.status });
@@ -295,6 +344,7 @@ module.exports = async (req, res) => {
           provider: provider.name,
           model: provider.model,
           status: "success",
+          durationMs: Date.now() - attemptStartedAt,
         });
         attemptLog.push({ provider: provider.name, model: provider.model, status: "success" });
         logFinal({
@@ -317,11 +367,32 @@ module.exports = async (req, res) => {
 
         upstream.data.pipe(res);
 
-        await new Promise((resolve, reject) => {
-          upstream.data.on("end", resolve);
-          upstream.data.on("error", reject);
-          res.on("close", resolve);
-        });
+        // Tunggu stream selesai. Kalau error di tengah jalan (koneksi
+        // putus, provider timeout mid-stream), catat ke log — response
+        // sudah terlanjur dikirim sebagian ke client jadi kita tidak bisa
+        // fallback lagi, tapi setidaknya ini TERCATAT, bukan silent fail.
+        try {
+          await new Promise((resolve, reject) => {
+            upstream.data.on("end", resolve);
+            upstream.data.on("error", reject);
+            res.on("close", resolve);
+          });
+        } catch (streamErr) {
+          console.error(JSON.stringify({
+            tag: "GATEWAY_STREAM_ERROR",
+            timestamp: new Date().toISOString(),
+            requestedModel,
+            provider: provider.name,
+            model: provider.model,
+            message: streamErr?.message || String(streamErr),
+          }));
+          // Response sudah mulai terkirim (headers + sebagian body SSE),
+          // tidak bisa lagi kirim status baru — cukup pastikan koneksi
+          // ditutup rapi supaya client tidak menggantung.
+          if (!res.writableEnded) {
+            try { res.end(); } catch (_) { /* koneksi mungkin sudah tertutup */ }
+          }
+        }
 
         return;
       } else {
@@ -346,6 +417,7 @@ module.exports = async (req, res) => {
           provider: provider.name,
           model: provider.model,
           status: "success",
+          durationMs: Date.now() - attemptStartedAt,
         });
         attemptLog.push({ provider: provider.name, model: provider.model, status: "success" });
         logFinal({
@@ -387,6 +459,7 @@ module.exports = async (req, res) => {
         model: provider.model,
         status: "failed",
         httpStatus: status || null,
+        durationMs: Date.now() - attemptStartedAt,
         detail: String(detail).slice(0, 500),
       });
       attemptLog.push({ provider: provider.name, model: provider.model, status: "failed", httpStatus: status || null });
@@ -421,7 +494,7 @@ module.exports = async (req, res) => {
       attempts: attemptLog,
     },
   });
-};
+}
 
 module.exports.config = {
   api: {
