@@ -233,32 +233,19 @@ module.exports = async (req, res) => {
       model: provider.model,
     };
 
-    // Bersihkan sisa field lama yang mungkin dikirim client secara keliru
+    // PENTING — dikonfirmasi langsung oleh staf Google di forum resmi
+    // (discuss.ai.google.dev, 10 Nov 2025): safety_settings TIDAK
+    // didukung sama sekali di endpoint OpenAI-compatible Gemini
+    // (v1beta/openai), baik di top-level maupun dibungkus di
+    // extra_body.google — keduanya sama-sama ditolak dengan error 400
+    // "Cannot find field". Ini limitasi resmi dari Google, bukan bug
+    // struktur payload kita, dan belum ada tanggal perbaikan.
+    // Solusi: JANGAN kirim field ini sama sekali ke Gemini lewat
+    // endpoint ini. Field apa pun dari client yang menyentuh ini
+    // dibuang total untuk semua provider.
     delete payload.safetySettings;
     delete payload.safety_settings;
-
-    const isGemini = provider.baseURL.includes("generativelanguage.googleapis.com");
-    if (isGemini) {
-      // PENTING: endpoint OpenAI-compatible Gemini (v1beta/openai) TIDAK
-      // menerima safety_settings di top-level payload — harus dibungkus
-      // di dalam extra_body.google, sesuai dokumentasi resmi Google Cloud:
-      // docs.cloud.google.com/vertex-ai/generative-ai/docs/multimodal/call-gemini-using-openai-library
-      payload.extra_body = {
-        ...(basePayload.extra_body || {}),
-        google: {
-          ...(basePayload.extra_body?.google || {}),
-          safety_settings: basePayload.extra_body?.google?.safety_settings || [
-            { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
-            { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
-            { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
-            { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
-            { category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "BLOCK_NONE" },
-          ],
-        },
-      };
-    } else {
-      delete payload.extra_body;
-    }
+    delete payload.extra_body;
 
     try {
       if (isStream) {
