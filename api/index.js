@@ -174,7 +174,11 @@ module.exports = async (req, res) => {
     return res.status(200).end();
   }
 
-  if (req.method === "GET" && req.url.includes("/v1/models")) {
+  // Cocokkan path /models baik dengan atau tanpa prefix /v1 — vercel.json
+  // Anda merewrite semua path ke function ini, jadi req.url bisa berupa
+  // "/models" saja (sesuai rewrite rule) atau "/v1/models" tergantung
+  // konfigurasi. includes() dipakai supaya keduanya tertangkap.
+  if (req.method === "GET" && req.url.includes("/models")) {
     res.setHeader("Cache-Control", "s-maxage=86400, stale-while-revalidate");
     return res.status(200).json({
       object: "list",
@@ -187,7 +191,7 @@ module.exports = async (req, res) => {
   }
 
   if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed. Gunakan POST ke /v1/chat/completions" });
+    return res.status(405).json({ error: "Method not allowed. Gunakan POST ke /chat/completions" });
   }
 
   const clientBody = req.body || {};
