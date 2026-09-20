@@ -10,6 +10,29 @@ const https = require("https");
 const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 50 });
 
 // =========================================================================
+// LOGGING HELPER — semua log ditulis dalam format JSON satu baris agar
+// mudah dibaca / difilter di Vercel Logs (Vercel otomatis menangkap
+// console.log/console.error dari serverless function).
+// =========================================================================
+function logAttempt(event) {
+  // event: { requestedModel, provider, model, status: "success"|"failed"|"skipped", detail, httpStatus }
+  console.log(JSON.stringify({
+    tag: "GATEWAY_ATTEMPT",
+    timestamp: new Date().toISOString(),
+    ...event,
+  }));
+}
+
+function logFinal(event) {
+  // event: { requestedModel, finalProvider, finalModel, fallbackHappened, totalAttempts }
+  console.log(JSON.stringify({
+    tag: "GATEWAY_FINAL",
+    timestamp: new Date().toISOString(),
+    ...event,
+  }));
+}
+
+// =========================================================================
 // 1. PLACEHOLDER API KEY — GANTI DENGAN KEY ASLI ANDA
 //    Bisa diisi langsung di sini, ATAU (lebih aman) diisi lewat
 //    Environment Variables di dashboard Vercel dengan nama yang sama.
@@ -82,6 +105,64 @@ const PROVIDERS = [
 ];
 
 // =========================================================================
+// 2b. RESOLVER MODEL SPESIFIK DARI CLIENT (mis. via command /set-model)
+//     Dipakai saat client secara eksplisit minta model tertentu yang tidak
+//     ada di daftar PROVIDERS default di atas. Logika hybrid:
+//       1) Cek MODEL_MAPPING (alias exact) dulu.
+//       2) Kalau tidak ketemu, tebak dari pola nama model.
+//       3) Kalau provider hasil deteksi ini gagal, kode utama akan tetap
+//          lanjut ke urutan PROVIDERS default sebagai fallback penuh.
+// =========================================================================
+
+// Definisi baseURL + key per provider, dipakai ulang baik oleh PROVIDERS
+// (tier default) maupun oleh resolver model custom di bawah ini.
+const PROVIDER_BASE = {
+  gemini1: { name: "Gemini (Key 1 - custom)", baseURL: "https://generativelanguage.googleapis.com/v1beta/openai", apiKey: KEY_GEMINI_1 },
+  gemini2: { name: "Gemini (Key 2 - custom)", baseURL: "https://generativelanguage.googleapis.com/v1beta/openai", apiKey: KEY_GEMINI_2 },
+  groq: { name: "Groq (custom)", baseURL: "https://api.groq.com/openai/v1", apiKey: KEY_GROQ },
+  cerebras: { name: "Cerebras (custom)", baseURL: "https://api.cerebras.ai/v1", apiKey: KEY_CEREBRAS },
+  openrouter: { name: "OpenRouter (custom)", baseURL: "https://openrouter.ai/api/v1", apiKey: KEY_OPENROUTER },
+};
+
+// Daftar Pemetaan Utama — alias/exact match model -> key provider di atas.
+// Tambahkan entri baru di sini kapan pun ada model spesifik yang perlu
+// diarahkan secara pasti (paling akurat, tidak bergantung tebakan pola).
+const MODEL_MAPPING = {
+  "llama-3.1-8b-instant": "groq",
+  "llama-3.2-90b-vision-preview": "groq",
+  "llama-3.2-11b-vision-preview": "groq",
+  "mixtral-8x7b-32768": "groq",
+  "gemma2-9b-it": "groq",
+  "llama3.1-8b": "cerebras",
+  "llama3.1-70b": "cerebras",
+};
+
+// Fallback Pattern Matching — dipakai kalau model tidak ada di MODEL_MAPPING.
+function detectProviderKeyFromPattern(model) {
+  const m = model.toLowerCase();
+  if (m.includes("gemini")) return "gemini1";
+  if (m.includes("/")) return "openrouter"; // slug OpenRouter selalu ada "/" (mis. meta-llama/...)
+  if (m.includes("llama") || m.includes("gemma") || m.includes("mixtral")) return "groq";
+  return null; // tidak terdeteksi -> tidak ada reorder, pakai urutan default saja
+}
+
+// Bangun objek provider "custom" siap pakai untuk model spesifik yang diminta client.
+function resolveCustomProvider(requestedModel) {
+  if (!requestedModel || requestedModel === "(tidak disebutkan client)") return null;
+
+  const mappedKey = MODEL_MAPPING[requestedModel] || detectProviderKeyFromPattern(requestedModel);
+  if (!mappedKey || !PROVIDER_BASE[mappedKey]) return null;
+
+  const base = PROVIDER_BASE[mappedKey];
+  return {
+    name: `${base.name} [diminta client: ${requestedModel}]`,
+    baseURL: base.baseURL,
+    apiKey: base.apiKey,
+    model: requestedModel, // model PERSIS seperti yang diminta client, tidak di-override
+  };
+}
+
+// =========================================================================
 // 3. HANDLER UTAMA
 // =========================================================================
 module.exports = async (req, res) => {
@@ -116,19 +197,46 @@ module.exports = async (req, res) => {
 
   const clientBody = req.body || {};
   const isStream = clientBody.stream === true;
+  const requestedModel = clientBody.model || "(tidak disebutkan client)";
 
   // Payload dasar hasil forward dari client, model akan di-override per provider
   const basePayload = { ...clientBody };
 
   let lastError = null;
+  const attemptLog = []; // rekam semua percobaan untuk ringkasan akhir
+
+  // Jika client minta model spesifik (mis. via /set-model) yang cocok dengan
+  // salah satu provider, coba provider itu DULUAN dengan model persis yang
+  // diminta. Kalau gagal, loop di bawah tetap lanjut ke urutan PROVIDERS
+  // default penuh (Gemini -> Groq -> Cerebras -> OpenRouter) seperti biasa.
+  const customProvider = resolveCustomProvider(requestedModel);
+  const executionOrder = customProvider ? [customProvider, ...PROVIDERS] : PROVIDERS;
+
+  if (customProvider) {
+    logAttempt({
+      requestedModel,
+      provider: customProvider.name,
+      model: customProvider.model,
+      status: "reordered",
+      detail: "Model diminta client cocok dengan provider ini, dicoba lebih dulu.",
+    });
+  }
 
   // =======================================================================
   // 4. LOOP SEQUENTIAL TRY-CATCH — coba tiap provider satu per satu
   // =======================================================================
-  for (const provider of PROVIDERS) {
+  for (const provider of executionOrder) {
     // Lewati provider yang key-nya belum diisi (masih placeholder)
     if (!provider.apiKey || provider.apiKey.startsWith("ISI_API_KEY")) {
       lastError = new Error(`${provider.name}: API key belum diisi, dilewati.`);
+      logAttempt({
+        requestedModel,
+        provider: provider.name,
+        model: provider.model,
+        status: "skipped",
+        detail: "API key belum diisi",
+      });
+      attemptLog.push({ provider: provider.name, model: provider.model, status: "skipped" });
       continue;
     }
 
@@ -188,14 +296,45 @@ module.exports = async (req, res) => {
             upstream.data.on("error", resolve);
           });
           lastError = new Error(`${provider.name} gagal (HTTP ${upstream.status}): ${errBody}`);
+          logAttempt({
+            requestedModel,
+            provider: provider.name,
+            model: provider.model,
+            status: "failed",
+            httpStatus: upstream.status,
+            detail: errBody.slice(0, 500), // batasi panjang log
+          });
+          attemptLog.push({ provider: provider.name, model: provider.model, status: "failed", httpStatus: upstream.status });
           continue; // lanjut ke provider berikutnya
         }
 
-        // Sukses -> set header SSE dan pipe response ke client
+        // Sukses -> log dan set header SSE, lalu pipe response ke client
+        logAttempt({
+          requestedModel,
+          provider: provider.name,
+          model: provider.model,
+          status: "success",
+        });
+        attemptLog.push({ provider: provider.name, model: provider.model, status: "success" });
+        logFinal({
+          requestedModel,
+          finalProvider: provider.name,
+          finalModel: provider.model,
+          fallbackHappened: attemptLog.length > 1,
+          totalAttempts: attemptLog.length,
+          attempts: attemptLog,
+        });
+
         res.status(200);
         res.setHeader("Content-Type", "text/event-stream");
         res.setHeader("Cache-Control", "no-cache");
         res.setHeader("Connection", "keep-alive");
+        // Header meta agar client (atau Anda saat debug) tahu provider/model
+        // yang benar-benar mengeksekusi request, tanpa merusak format SSE body.
+        res.setHeader("X-Gateway-Requested-Model", requestedModel);
+        res.setHeader("X-Gateway-Final-Provider", provider.name);
+        res.setHeader("X-Gateway-Final-Model", provider.model);
+        res.setHeader("X-Gateway-Fallback-Happened", String(attemptLog.length > 1));
 
         upstream.data.pipe(res);
 
@@ -224,8 +363,39 @@ module.exports = async (req, res) => {
           }
         );
 
-        // Sukses -> langsung kembalikan response (sudah format OpenAI-compatible)
-        return res.status(200).json(response.data);
+        // Sukses -> log lalu kembalikan response (sudah format OpenAI-compatible)
+        // ditambah field _gateway_meta untuk visibilitas provider/model asli.
+        logAttempt({
+          requestedModel,
+          provider: provider.name,
+          model: provider.model,
+          status: "success",
+        });
+        attemptLog.push({ provider: provider.name, model: provider.model, status: "success" });
+        logFinal({
+          requestedModel,
+          finalProvider: provider.name,
+          finalModel: provider.model,
+          fallbackHappened: attemptLog.length > 1,
+          totalAttempts: attemptLog.length,
+          attempts: attemptLog,
+        });
+
+        res.setHeader("X-Gateway-Requested-Model", requestedModel);
+        res.setHeader("X-Gateway-Final-Provider", provider.name);
+        res.setHeader("X-Gateway-Final-Model", provider.model);
+        res.setHeader("X-Gateway-Fallback-Happened", String(attemptLog.length > 1));
+
+        return res.status(200).json({
+          ...response.data,
+          _gateway_meta: {
+            requested_model: requestedModel,
+            final_provider: provider.name,
+            final_model: provider.model,
+            fallback_happened: attemptLog.length > 1,
+            attempts: attemptLog,
+          },
+        });
       }
     } catch (err) {
       // Tangkap error HTTP (429 rate limit, 401 auth, 500 dll) ATAU network error
@@ -236,6 +406,16 @@ module.exports = async (req, res) => {
 
       lastError = new Error(`${provider.name} gagal (${status || "network error"}): ${detail}`);
 
+      logAttempt({
+        requestedModel,
+        provider: provider.name,
+        model: provider.model,
+        status: "failed",
+        httpStatus: status || null,
+        detail: String(detail).slice(0, 500),
+      });
+      attemptLog.push({ provider: provider.name, model: provider.model, status: "failed", httpStatus: status || null });
+
       // Lanjut otomatis ke provider berikutnya (seamless fallback)
       continue;
     }
@@ -244,10 +424,27 @@ module.exports = async (req, res) => {
   // =======================================================================
   // 5. SEMUA PROVIDER GAGAL
   // =======================================================================
+  logFinal({
+    requestedModel,
+    finalProvider: null,
+    finalModel: null,
+    fallbackHappened: attemptLog.length > 1,
+    totalAttempts: attemptLog.length,
+    attempts: attemptLog,
+    allFailed: true,
+  });
+
   return res.status(502).json({
     error: {
       message: "Semua provider AI gagal merespons. Cek API key / kuota masing-masing provider.",
       last_error: lastError ? lastError.message : "Tidak diketahui",
+    },
+    _gateway_meta: {
+      requested_model: requestedModel,
+      final_provider: null,
+      final_model: null,
+      fallback_happened: attemptLog.length > 1,
+      attempts: attemptLog,
     },
   });
 };
