@@ -1,6 +1,7 @@
 // api/index.js
 // Serverless AI Router Proxy — auto-fallback sequential antar provider
 // Kompatibel dengan format OpenAI Chat Completion (SillyTavern / Saucepan.ai dll)
+// VERSI: 20 Sep 2026 — safety_settings fix, Groq gpt-oss, Cerebras dihapus, Mistral ditambahkan
 
 const axios = require("axios");
 const https = require("https");
@@ -15,7 +16,6 @@ const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 50 });
 // console.log/console.error dari serverless function).
 // =========================================================================
 function logAttempt(event) {
-  // event: { requestedModel, provider, model, status: "success"|"failed"|"skipped", detail, httpStatus }
   console.log(JSON.stringify({
     tag: "GATEWAY_ATTEMPT",
     timestamp: new Date().toISOString(),
@@ -24,7 +24,6 @@ function logAttempt(event) {
 }
 
 function logFinal(event) {
-  // event: { requestedModel, finalProvider, finalModel, fallbackHappened, totalAttempts }
   console.log(JSON.stringify({
     tag: "GATEWAY_FINAL",
     timestamp: new Date().toISOString(),
@@ -40,7 +39,7 @@ function logFinal(event) {
 const KEY_GEMINI_1   = process.env.KEY_GEMINI_1   || "ISI_API_KEY_GEMINI_1_DISINI";
 const KEY_GEMINI_2   = process.env.KEY_GEMINI_2   || "ISI_API_KEY_GEMINI_2_DISINI";
 const KEY_GROQ       = process.env.KEY_GROQ       || "ISI_API_KEY_GROQ_DISINI";
-const KEY_CEREBRAS   = process.env.KEY_CEREBRAS   || "ISI_API_KEY_CEREBRAS_DISINI";
+const KEY_MISTRAL    = process.env.KEY_MISTRAL    || "ISI_API_KEY_MISTRAL_DISINI";
 const KEY_OPENROUTER = process.env.KEY_OPENROUTER || "ISI_API_KEY_OPENROUTER_DISINI";
 
 // =========================================================================
@@ -48,9 +47,6 @@ const KEY_OPENROUTER = process.env.KEY_OPENROUTER || "ISI_API_KEY_OPENROUTER_DIS
 //    Jika provider di urutan atas gagal (429 / error / limit), otomatis
 //    lanjut ke provider berikutnya tanpa memutus koneksi ke client.
 // =========================================================================
-// Urutan model Gemini per key: paling hemat token dulu (flash-lite),
-// baru naik ke flash biasa, dan 3.6-flash paling terakhir karena
-// dirancang untuk beban berat/agentic (boros token untuk sekadar roleplay santai).
 const GEMINI_MODEL_TIERS = [
   "gemini-3.5-flash-lite",
   "gemini-3.5-flash",
@@ -72,93 +68,97 @@ const PROVIDERS = [
     apiKey: KEY_GEMINI_2,
     model,
   })),
+  // Groq: llama-3.1-8b-instant dan llama-3.3-70b-versatile resmi
+  // decommissioned 16 Agustus 2026. Pengganti resmi:
+  // openai/gpt-oss-20b (utama) dan openai/gpt-oss-120b (cadangan).
   {
     name: "Groq",
     baseURL: "https://api.groq.com/openai/v1",
     apiKey: KEY_GROQ,
-    model: "llama-3.3-70b-versatile",
+    model: "openai/gpt-oss-20b",
   },
   {
-    name: "Cerebras",
-    baseURL: "https://api.cerebras.ai/v1",
-    apiKey: KEY_CEREBRAS,
-    model: "llama3.3-70b",
+    name: "Groq (gpt-oss-120b)",
+    baseURL: "https://api.groq.com/openai/v1",
+    apiKey: KEY_GROQ,
+    model: "openai/gpt-oss-120b",
   },
-  // --- OpenRouter: beberapa model :free dicoba berurutan, ditutup dengan
-  //     "openrouter/free" (router otomatis bawaan OpenRouter yang memilih
-  //     sendiri model gratis mana pun yang sedang aktif) sebagai jaring
-  //     pengaman paling akhir. Roster model gratis di OpenRouter sering
-  //     berubah/di-delist, jadi tier terakhir ini penting agar proxy tidak
-  //     ikut mati saat satu model spesifik hilang dari katalog.
+  // Cerebras DIHAPUS: tidak lagi menyediakan free tier permanen berbasis
+  // rate limit — hanya $5 kredit trial sekali yang kadaluarsa 30 hari.
+  //
+  // --- OpenRouter: model spesifik dicoba dulu, openrouter/free di posisi
+  //     akhir (di bawah, setelah Mistral) sebagai jaring pengaman utama.
   ...[
-    "cognitivecomputations/dolphin-mistral-24b-venice-edition:free", // uncensored, cocok untuk roleplay
-    "google/gemma-4-26b-a4b-it:free",                                // MoE, konteks besar, terverifikasi hidup
-    "openai/gpt-oss-20b:free",                                       // ringan, reasoning OpenAI open-weight
-    "meta-llama/llama-3.3-70b-instruct:free",                        // model lama yang sudah teruji
-    "openrouter/free",                                               // jaring pengaman: auto-pilih model gratis apa pun yang masih aktif
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "google/gemma-4-26b-a4b-it:free",
   ].map((model) => ({
     name: `OpenRouter (${model})`,
     baseURL: "https://openrouter.ai/api/v1",
     apiKey: KEY_OPENROUTER,
     model,
   })),
+  // Mistral AI (La Plateforme) — free "Experiment" tier, endpoint OpenAI-
+  // compatible (base URL https://api.mistral.ai/v1). Butuh verifikasi
+  // nomor telepon + opt-in data training saat pertama daftar akun;
+  // rate limit ~1 req/detik, untuk evaluasi bukan produksi volume tinggi.
+  {
+    name: "Mistral (mistral-small-latest)",
+    baseURL: "https://api.mistral.ai/v1",
+    apiKey: KEY_MISTRAL,
+    model: "mistral-small-latest",
+  },
+  // OpenRouter jaring pengaman utama — auto-pilih model gratis yang masih
+  // aktif, percobaan terakhir sebelum gateway benar-benar menyerah.
+  {
+    name: "OpenRouter (openrouter/free)",
+    baseURL: "https://openrouter.ai/api/v1",
+    apiKey: KEY_OPENROUTER,
+    model: "openrouter/free",
+  },
 ];
 
 // =========================================================================
 // 2b. RESOLVER MODEL SPESIFIK DARI CLIENT (mis. via command /set-model)
-//     Dipakai saat client secara eksplisit minta model tertentu yang tidak
-//     ada di daftar PROVIDERS default di atas. Logika hybrid:
-//       1) Cek MODEL_MAPPING (alias exact) dulu.
-//       2) Kalau tidak ketemu, tebak dari pola nama model.
-//       3) Kalau provider hasil deteksi ini gagal, kode utama akan tetap
-//          lanjut ke urutan PROVIDERS default sebagai fallback penuh.
 // =========================================================================
-
-// Definisi baseURL + key per provider, dipakai ulang baik oleh PROVIDERS
-// (tier default) maupun oleh resolver model custom di bawah ini.
 const PROVIDER_BASE = {
   gemini1: { name: "Gemini (Key 1 - custom)", baseURL: "https://generativelanguage.googleapis.com/v1beta/openai", apiKey: KEY_GEMINI_1 },
   gemini2: { name: "Gemini (Key 2 - custom)", baseURL: "https://generativelanguage.googleapis.com/v1beta/openai", apiKey: KEY_GEMINI_2 },
   groq: { name: "Groq (custom)", baseURL: "https://api.groq.com/openai/v1", apiKey: KEY_GROQ },
-  cerebras: { name: "Cerebras (custom)", baseURL: "https://api.cerebras.ai/v1", apiKey: KEY_CEREBRAS },
+  mistral: { name: "Mistral (custom)", baseURL: "https://api.mistral.ai/v1", apiKey: KEY_MISTRAL },
   openrouter: { name: "OpenRouter (custom)", baseURL: "https://openrouter.ai/api/v1", apiKey: KEY_OPENROUTER },
 };
 
-// Daftar Pemetaan Utama — alias/exact match model -> key provider di atas.
-// Tambahkan entri baru di sini kapan pun ada model spesifik yang perlu
-// diarahkan secara pasti (paling akurat, tidak bergantung tebakan pola).
 const MODEL_MAPPING = {
   "llama-3.1-8b-instant": "groq",
   "llama-3.2-90b-vision-preview": "groq",
   "llama-3.2-11b-vision-preview": "groq",
   "mixtral-8x7b-32768": "groq",
   "gemma2-9b-it": "groq",
-  "llama3.1-8b": "cerebras",
-  "llama3.1-70b": "cerebras",
+  "mistral-small-latest": "mistral",
+  "mistral-large-latest": "mistral",
+  "open-mistral-7b": "mistral",
+  "open-mixtral-8x7b": "mistral",
 };
 
-// Fallback Pattern Matching — dipakai kalau model tidak ada di MODEL_MAPPING.
 function detectProviderKeyFromPattern(model) {
   const m = model.toLowerCase();
   if (m.includes("gemini")) return "gemini1";
-  if (m.includes("/")) return "openrouter"; // slug OpenRouter selalu ada "/" (mis. meta-llama/...)
-  if (m.includes("llama") || m.includes("gemma") || m.includes("mixtral")) return "groq";
-  return null; // tidak terdeteksi -> tidak ada reorder, pakai urutan default saja
+  if (m.includes("/")) return "openrouter";
+  if (m.includes("mistral") || m.includes("mixtral")) return "mistral";
+  if (m.includes("llama") || m.includes("gemma")) return "groq";
+  return null;
 }
 
-// Bangun objek provider "custom" siap pakai untuk model spesifik yang diminta client.
 function resolveCustomProvider(requestedModel) {
   if (!requestedModel || requestedModel === "(tidak disebutkan client)") return null;
-
   const mappedKey = MODEL_MAPPING[requestedModel] || detectProviderKeyFromPattern(requestedModel);
   if (!mappedKey || !PROVIDER_BASE[mappedKey]) return null;
-
   const base = PROVIDER_BASE[mappedKey];
   return {
     name: `${base.name} [diminta client: ${requestedModel}]`,
     baseURL: base.baseURL,
     apiKey: base.apiKey,
-    model: requestedModel, // model PERSIS seperti yang diminta client, tidak di-override
+    model: requestedModel,
   };
 }
 
@@ -166,7 +166,6 @@ function resolveCustomProvider(requestedModel) {
 // 3. HANDLER UTAMA
 // =========================================================================
 module.exports = async (req, res) => {
-  // CORS dasar (agar bisa diakses dari browser-based client seperti SillyTavern web)
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
@@ -175,11 +174,7 @@ module.exports = async (req, res) => {
     return res.status(200).end();
   }
 
-  // Endpoint list model (opsional, agar client seperti SillyTavern bisa
-  // fetch daftar model tanpa error saat pertama connect)
   if (req.method === "GET" && req.url.includes("/v1/models")) {
-    // Cache di CDN Vercel selama 24 jam — daftar model statis, tidak perlu
-    // di-generate ulang tiap request.
     res.setHeader("Cache-Control", "s-maxage=86400, stale-while-revalidate");
     return res.status(200).json({
       object: "list",
@@ -198,17 +193,11 @@ module.exports = async (req, res) => {
   const clientBody = req.body || {};
   const isStream = clientBody.stream === true;
   const requestedModel = clientBody.model || "(tidak disebutkan client)";
-
-  // Payload dasar hasil forward dari client, model akan di-override per provider
   const basePayload = { ...clientBody };
 
   let lastError = null;
-  const attemptLog = []; // rekam semua percobaan untuk ringkasan akhir
+  const attemptLog = [];
 
-  // Jika client minta model spesifik (mis. via /set-model) yang cocok dengan
-  // salah satu provider, coba provider itu DULUAN dengan model persis yang
-  // diminta. Kalau gagal, loop di bawah tetap lanjut ke urutan PROVIDERS
-  // default penuh (Gemini -> Groq -> Cerebras -> OpenRouter) seperti biasa.
   const customProvider = resolveCustomProvider(requestedModel);
   const executionOrder = customProvider ? [customProvider, ...PROVIDERS] : PROVIDERS;
 
@@ -226,7 +215,6 @@ module.exports = async (req, res) => {
   // 4. LOOP SEQUENTIAL TRY-CATCH — coba tiap provider satu per satu
   // =======================================================================
   for (const provider of executionOrder) {
-    // Lewati provider yang key-nya belum diisi (masih placeholder)
     if (!provider.apiKey || provider.apiKey.startsWith("ISI_API_KEY")) {
       lastError = new Error(`${provider.name}: API key belum diisi, dilewati.`);
       logAttempt({
@@ -240,32 +228,36 @@ module.exports = async (req, res) => {
       continue;
     }
 
-    // Siapkan payload sesuai provider:
-    // - Untuk Gemini: inject safetySettings (BLOCK_NONE) jika belum ada
-    // - Untuk provider lain: hapus safetySettings dari payload (agar tidak error 400)
     let payload = {
       ...basePayload,
       model: provider.model,
     };
 
-    // Conditional payload per provider
+    // Bersihkan sisa field lama yang mungkin dikirim client secara keliru
+    delete payload.safetySettings;
+    delete payload.safety_settings;
+
     const isGemini = provider.baseURL.includes("generativelanguage.googleapis.com");
     if (isGemini) {
-      // Inject safetySettings untuk Gemini jika belum ada di request client.
-      // Gunakan kategori spesifik (bukan HARM_CATEGORY_ALL, yang tidak
-      // didukung resmi oleh API Gemini) agar payload valid.
-      if (!payload.safetySettings) {
-        payload.safetySettings = [
-          { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
-          { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
-          { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
-          { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
-          { category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "BLOCK_NONE" },
-        ];
-      }
+      // PENTING: endpoint OpenAI-compatible Gemini (v1beta/openai) TIDAK
+      // menerima safety_settings di top-level payload — harus dibungkus
+      // di dalam extra_body.google, sesuai dokumentasi resmi Google Cloud:
+      // docs.cloud.google.com/vertex-ai/generative-ai/docs/multimodal/call-gemini-using-openai-library
+      payload.extra_body = {
+        ...(basePayload.extra_body || {}),
+        google: {
+          ...(basePayload.extra_body?.google || {}),
+          safety_settings: basePayload.extra_body?.google?.safety_settings || [
+            { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "BLOCK_NONE" },
+          ],
+        },
+      };
     } else {
-      // Strip safetySettings untuk provider non-Gemini (agar tidak error 400 Bad Request)
-      delete payload.safetySettings;
+      delete payload.extra_body;
     }
 
     try {
@@ -284,11 +276,10 @@ module.exports = async (req, res) => {
           httpsAgent: keepAliveAgent,
           responseType: "stream",
           timeout: 60000,
-          validateStatus: (status) => status < 500, // biar 4xx tetap masuk try, ditangani manual
+          validateStatus: (status) => status < 500,
         });
 
         if (upstream.status === 429 || upstream.status >= 400) {
-          // Provider ini gagal / kena limit -> baca sedikit body error lalu lanjut fallback
           let errBody = "";
           await new Promise((resolve) => {
             upstream.data.on("data", (chunk) => (errBody += chunk));
@@ -302,13 +293,12 @@ module.exports = async (req, res) => {
             model: provider.model,
             status: "failed",
             httpStatus: upstream.status,
-            detail: errBody.slice(0, 500), // batasi panjang log
+            detail: errBody.slice(0, 500),
           });
           attemptLog.push({ provider: provider.name, model: provider.model, status: "failed", httpStatus: upstream.status });
-          continue; // lanjut ke provider berikutnya
+          continue;
         }
 
-        // Sukses -> log dan set header SSE, lalu pipe response ke client
         logAttempt({
           requestedModel,
           provider: provider.name,
@@ -329,8 +319,6 @@ module.exports = async (req, res) => {
         res.setHeader("Content-Type", "text/event-stream");
         res.setHeader("Cache-Control", "no-cache");
         res.setHeader("Connection", "keep-alive");
-        // Header meta agar client (atau Anda saat debug) tahu provider/model
-        // yang benar-benar mengeksekusi request, tanpa merusak format SSE body.
         res.setHeader("X-Gateway-Requested-Model", requestedModel);
         res.setHeader("X-Gateway-Final-Provider", provider.name);
         res.setHeader("X-Gateway-Final-Model", provider.model);
@@ -338,17 +326,16 @@ module.exports = async (req, res) => {
 
         upstream.data.pipe(res);
 
-        // Tunggu sampai stream selesai sebelum function berakhir
         await new Promise((resolve, reject) => {
           upstream.data.on("end", resolve);
           upstream.data.on("error", reject);
           res.on("close", resolve);
         });
 
-        return; // selesai, tidak perlu coba provider lain
+        return;
       } else {
         // -----------------------------------------------------------------
-        // MODE NON-STREAMING: request biasa, format OpenAI Chat Completion
+        // MODE NON-STREAMING
         // -----------------------------------------------------------------
         const response = await axios.post(
           `${provider.baseURL}/chat/completions`,
@@ -363,8 +350,6 @@ module.exports = async (req, res) => {
           }
         );
 
-        // Sukses -> log lalu kembalikan response (sudah format OpenAI-compatible)
-        // ditambah field _gateway_meta untuk visibilitas provider/model asli.
         logAttempt({
           requestedModel,
           provider: provider.name,
@@ -398,7 +383,6 @@ module.exports = async (req, res) => {
         });
       }
     } catch (err) {
-      // Tangkap error HTTP (429 rate limit, 401 auth, 500 dll) ATAU network error
       const status = err.response?.status;
       const detail = err.response?.data
         ? JSON.stringify(err.response.data)
@@ -416,7 +400,6 @@ module.exports = async (req, res) => {
       });
       attemptLog.push({ provider: provider.name, model: provider.model, status: "failed", httpStatus: status || null });
 
-      // Lanjut otomatis ke provider berikutnya (seamless fallback)
       continue;
     }
   }
@@ -449,8 +432,6 @@ module.exports = async (req, res) => {
   });
 };
 
-// Konfigurasi khusus Vercel: nonaktifkan body parser bawaan jika perlu raw body,
-// tapi di sini kita tetap pakai default (JSON) karena payload client berupa JSON biasa.
 module.exports.config = {
   api: {
     bodyParser: true,
