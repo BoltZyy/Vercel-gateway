@@ -297,6 +297,13 @@ async function handleRequest(req, res) {
     delete payload.safety_settings;
     delete payload.extra_body;
 
+    const isGemini =
+      provider.baseURL.includes("generativelanguage.googleapis.com");
+
+    if (isGemini) {
+      delete payload.store;
+    }
+
     const attemptStartedAt = Date.now(); // untuk hitung latency per attempt
 
     try {
